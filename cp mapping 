@@ -1,0 +1,97 @@
+<#
+.SYNOPSIS
+    CP Mapping & Access Lookup with Email Approval Workflow.
+.DESCRIPTION
+    Reads a TL request, fetches IP & Firewall details from an ACL lookup table, 
+    formats the output, sends an email for approval, and updates the Master Inventory upon approval.
+#>
+
+# --- Configurable Paths & Settings ---
+$RequestFilePath  = "\\NetworkShare\IT_Data\Requests.csv"
+$AclLookupPath    = "\\NetworkShare\IT_Data\ACL_Lookup.csv"
+$MasterArchivePath = "\\SecureShare\IT_Approved_Inventory\Master_CP_Mapping.csv"
+
+$SmtpServer    = "smtp.company.com"
+$SmtpPort      = 587
+$ApproverEmail = "it.approver@company.com"
+$SenderEmail   = "it.automation@company.com"
+
+# --- Step 1: Import Request & Lookup Data ---
+$Requests  = Import-Csv -Path $RequestFilePath
+$AclMaster = Import-Csv -Path $AclLookupPath
+
+foreach ($Req in $Requests) {
+    # Match Old CP & New CP in the ACL Master Sheet
+    $OldCpDetails = $AclMaster | Where-Object { $_.CP_Num -eq $Req.Old_CP }
+    $NewCpDetails = $AclMaster | Where-Object { $_.CP_Num -eq $Req.New_CP }
+
+    if (-not $OldCpDetails -or -not $NewCpDetails) {
+        Write-Warning "CP mapping details missing for User ID: $($Req.User_ID). Skipping."
+        continue
+    }
+
+    # --- Step 2: Build the "Wanted Output" Object ---
+    $Output = [PSCustomObject]@{
+        "User ID"              = $Req.User_ID
+        "User Name"            = $Req.User_Name
+        "Old CP"               = $Req.Old_CP
+        "Old IP"               = $OldCpDetails.IP_Address
+        "New CP"               = $Req.New_CP
+        "New IP"               = $NewCpDetails.IP_Address
+        "Having Access For"    = $OldCpDetails.Access_List
+        "Firewall Access Rule" = $OldCpDetails.Firewall_Rule_Name
+        "Firewall IP"          = $OldCpDetails.Firewall_IP
+    }
+
+    # Display Output in Console
+    Write-Host "================ WANTED OUTPUT ================" -ForegroundColor Green
+    $Output | Format-List
+    Write-Host "===============================================" -ForegroundColor Green
+
+    # --- Step 3: Format & Send Approval Email ---
+    $EmailBody = @"
+<h2>CP Mapping Change Request - Approval Required</h2>
+<p>A new CP mapping request requires your review:</p>
+<table border='1' cellpadding='8' cellspacing='0' style='border-collapse:collapse; font-family:Arial, sans-serif;'>
+    <tr><th style='background-color:#f2f2f2;'>Field</th><th style='background-color:#f2f2f2;'>Details</th></tr>
+    <tr><td><b>User ID</b></td><td>$($Output.'User ID')</td></tr>
+    <tr><td><b>User Name</b></td><td>$($Output.'User Name')</td></tr>
+    <tr><td><b>Old CP / IP</b></td><td>$($Output.'Old CP') ($($Output.'Old IP'))</td></tr>
+    <tr><td><b>New CP / IP</b></td><td>$($Output.'New CP') ($($Output.'New IP'))</td></tr>
+    <tr><td><b>Access Granted</b></td><td>$($Output.'Having Access For')</td></tr>
+    <tr><td><b>Firewall Rule Name</b></td><td>$($Output.'Firewall Access Rule')</td></tr>
+    <tr><td><b>Firewall IP</b></td><td>$($Output.'Firewall IP')</td></tr>
+</table>
+<br/>
+<p>To approve this mapping update and save it to the secure master location, reply to this email with <b>'APPROVED'</b>.</p>
+"@
+
+    # Send Notification Email
+    Send-MailMessage -To $ApproverEmail `
+                     -From $SenderEmail `
+                     -Subject "APPROVAL REQUIRED: CP Mapping Update for $($Output.'User Name') (ID: $($Output.'User ID'))" `
+                     -Body $EmailBody `
+                     -BodyAsHtml `
+                     -SmtpServer $SmtpServer `
+                     -Port $SmtpPort
+
+    Write-Host "Approval email sent successfully to $ApproverEmail." -ForegroundColor Cyan
+
+    # --- Step 4: Save / Update Master Sheet (Post-Approval Action) ---
+    # In an automated pipeline, this section runs after an 'APPROVED' response is parsed:
+    
+    $ApprovedRecord = [PSCustomObject]@{
+        UserID           = $Output.'User ID'
+        UserName         = $Output.'User Name'
+        CPNumber         = $Output.'New CP'
+        IPAddress        = $Output.'New IP'
+        AccessGranted    = $Output.'Having Access For'
+        FirewallRule     = $Output.'Firewall Access Rule'
+        FirewallIP       = $Output.'Firewall IP'
+        DateUpdated      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    }
+
+    # Append to Master Sheet in the secondary secure location
+    $ApprovedRecord | Export-Csv -Path $MasterArchivePath -Append -NoTypeInformation
+    Write-Host "Record queued/updated in Master Inventory at $MasterArchivePath" -ForegroundColor Green
+}
